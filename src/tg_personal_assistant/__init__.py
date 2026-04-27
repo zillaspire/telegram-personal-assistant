@@ -1,0 +1,2 @@
+"""Telegram personal assistant package."""
+
