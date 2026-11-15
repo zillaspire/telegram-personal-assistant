@@ -18,6 +18,19 @@ from telegram.ext import (
 
 Handler = Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[None]]
 
+AUTONOMOUS_SETTINGS_COMMANDS = {
+    "duration": "Длительность сессии в минутах",
+    "schedule_on": "Разрешить запуск по расписанию",
+    "schedule_off": "Отключить расписание",
+    "schedule": "Показать расписание",
+    "set_hours": "Задать часы работы, например 18:00 23:00",
+    "set_days": "Задать дни работы через запятую",
+    "set_timezone": "Задать часовой пояс IANA",
+    "limit": "Задать лимит сообщений",
+    "unlimited": "Убрать лимит сообщений",
+}
+
+
 BUTTON_STATUS = "Статус"
 BUTTON_AUTO_ON = "Включить автоответ"
 BUTTON_AUTO_OFF = "Выключить автоответ"
@@ -84,6 +97,10 @@ class ControlBotManager:
             ("delivery_reviewed", self._delivery_reviewed),
         ):
             self._application.add_handler(CommandHandler(command, self._owner_only(handler)))
+        for action in AUTONOMOUS_SETTINGS_COMMANDS:
+            self._application.add_handler(CommandHandler(
+                f"autonomous_{action}", self._owner_only(self._autonomous_settings_handler(action))
+            ))
         self._application.add_handler(CommandHandler("start", self._owner_only(self._start)))
         self._application.add_handler(CommandHandler("help", self._owner_only(self._help)))
         self._application.add_handler(CommandHandler("status", self._owner_only(self._status)))
@@ -114,6 +131,8 @@ class ControlBotManager:
         await self._application.initialize()
         await self._application.bot.set_my_commands(
             [
+                *(BotCommand(f"autonomous_{action}", description)
+                  for action, description in AUTONOMOUS_SETTINGS_COMMANDS.items()),
                 BotCommand("autonomous_start", "Запустить автономный диалог"),
                 BotCommand("autonomous_stop", "Остановить автономный диалог"),
                 BotCommand("autonomous_status", "Проверить автономную сессию"),
@@ -159,9 +178,26 @@ class ControlBotManager:
                     await self._assistant.set_mode("off")
                 elif command == "/autonomous_stop":
                     await self._assistant.stop_autonomous()
+                elif command == "/autonomous_schedule_off":
+                    await self._assistant.configure_autonomous("schedule_off", [])
                 elif command in ("/pause_30m", "/pause_2h", "/pause") or text in (BUTTON_PAUSE_30M, BUTTON_PAUSE_2H):
                     await self._assistant.pause_for(120 if command == "/pause_2h" or text == BUTTON_PAUSE_2H else 30)
             offset = updates[-1].update_id + 1
+
+    def _autonomous_settings_handler(self, action: str) -> Handler:
+        async def handle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+            try:
+                if action == "schedule":
+                    result = self._assistant.describe_autonomous_schedule()
+                else:
+                    result = await self._assistant.configure_autonomous(action, context.args or [])
+            except (ValueError, KeyError):
+                result = (
+                    "Проверьте параметры: длительность 15–300 минут, часы HH:MM HH:MM, "
+                    "дни mon,tue,wed,thu,fri,sat,sun, пояс IANA, лимит 1–1000."
+                )
+            await update.effective_message.reply_text(result)
+        return handle
 
     async def _autonomous_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         result = await self._assistant.start_autonomous(" ".join(context.args or []))
@@ -209,6 +245,7 @@ class ControlBotManager:
             "Панель управления готова.\n\n"
             "Самое полезное:\n"
             "/autonomous_start [задача] · /autonomous_stop · /autonomous_status\n"
+            "/autonomous_schedule — расписание; остальные настройки доступны в меню команд\n"
             "/status — текущее состояние\n"
             "/auto_on — включить автоответ\n"
             "/auto_off — выключить автоответ\n"
@@ -229,6 +266,7 @@ class ControlBotManager:
         text = (
             "Команды управления:\n\n"
             "/autonomous_start [задача] · /autonomous_stop · /autonomous_status\n"
+            "/autonomous_schedule — расписание; остальные настройки доступны в меню команд\n"
             "/status — показывает, включён ли автоответ, есть ли пауза и какой чат подключён\n"
             "/auto_on — включает автоответ\n"
             "/auto_off — полностью выключает автоответ\n"

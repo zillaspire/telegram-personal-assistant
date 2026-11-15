@@ -34,6 +34,6 @@ sqlite_db_path = "./data/personal-assistant.sqlite3"
 [autonomous]
 min_interval_sec = 5
 max_interval_sec = 12
-max_messages = 20
+max_messages = 0 # 0 means no fixed message limit
 max_duration_sec = 3600
 history_limit = 24

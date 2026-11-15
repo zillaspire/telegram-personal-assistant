@@ -14,6 +14,9 @@ from typing import Any
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
+from zoneinfo import ZoneInfo
+
+from tg_personal_assistant.autonomous_schedule import DAYS, DEFAULT_SCHEDULE, current_window, parse_hour
 from tg_personal_assistant.codex_client import CodexCliClient
 from tg_personal_assistant.config import AppSettings
 from tg_personal_assistant.state import StateStore
@@ -198,6 +201,7 @@ class PersonalAssistantRuntime:
         self._send_lock = asyncio.Lock()
         self._sending_task: asyncio.Task | None = None
         self._autonomy_ready = False
+        self._scheduler_task: asyncio.Task | None = None
         self._outgoing_ready = True
         self._closing = False
 
@@ -331,6 +335,9 @@ class PersonalAssistantRuntime:
 
     async def stop(self) -> None:
         self._closing = True
+        if self._scheduler_task:
+            self._scheduler_task.cancel()
+            await asyncio.gather(self._scheduler_task, return_exceptions=True)
         sending = self._sending_task
         self._cancel_in_flight()
 
@@ -1398,7 +1405,115 @@ class PersonalAssistantRuntime:
         if task and task is not asyncio.current_task() and not task.done():
             task.cancel()
 
-    async def start_autonomous(self, instruction: str) -> str:
+    def _autonomous_preferences(self) -> dict[str, Any]:
+        return self._store.get_json("autonomous_preferences")
+
+    def _autonomous_schedule(self) -> dict[str, Any]:
+        return DEFAULT_SCHEDULE | self._autonomous_preferences().get("schedule", {})
+
+    async def configure_autonomous(self, action: str, args: list[str]) -> str:
+        prefs = self._autonomous_preferences()
+        schedule = self._autonomous_schedule()
+        if action == "duration" and len(args) == 1:
+            minutes = int(args[0])
+            if not 15 <= minutes <= 300:
+                raise ValueError("15–300 minutes")
+            prefs["duration_sec"] = minutes * 60
+        elif action == "limit" and len(args) == 1:
+            count = int(args[0])
+            if not 1 <= count <= 1000:
+                raise ValueError("1–1000 messages")
+            prefs["max_messages"] = count
+        elif action == "unlimited" and not args:
+            prefs["max_messages"] = 0
+        elif action == "set_hours" and len(args) == 2 and args[0] != args[1]:
+            parse_hour(args[0])
+            parse_hour(args[1])
+            schedule.update(start=args[0], end=args[1])
+        elif action == "set_timezone" and len(args) == 1:
+            ZoneInfo(args[0])
+            schedule["timezone"] = args[0]
+        elif action == "set_days" and len(args) == 1:
+            days = args[0].lower().split(",")
+            if not set(days) <= set(DAYS):
+                raise ValueError("Invalid weekdays")
+            schedule["days"] = [day for day in DAYS if day in days]
+        elif action in ("schedule_on", "schedule_off") and not args:
+            schedule["enabled"] = action == "schedule_on"
+            schedule["armed"] = schedule["enabled"]
+        else:
+            raise ValueError("Invalid arguments")
+        prefs["schedule"] = schedule
+        self._store.set_json("autonomous_preferences", prefs)
+        if action == "schedule_off" and self._autonomous_session().get("mode") == "scheduled":
+            await self.stop_autonomous("schedule_disabled")
+        await self._scheduler_tick()
+        return self.describe_autonomous()
+
+    def describe_autonomous_schedule(self) -> str:
+        schedule = self._autonomous_schedule()
+        return (
+            f"Расписание: {'включено' if schedule['enabled'] else 'выключено'}, "
+            f"{schedule['start']}–{schedule['end']}\n"
+            f"Автозапуск: {'разрешён' if schedule.get('armed') else 'выключен'}\n"
+            f"Часовой пояс: {schedule['timezone']}\nДни: {', '.join(schedule['days'])}"
+        )
+
+    def _session_deadline(self, session: dict[str, Any]) -> float:
+        started = session["started_at"]
+        return min(
+            started + 18000,
+            session.get("ends_at", started + self._settings.autonomous.max_duration_sec),
+        )
+
+    def _autonomous_stop_reason(self, session: dict[str, Any]) -> str | None:
+        if not session:
+            return "inactive"
+        now = time.time()
+        if now >= self._session_deadline(session):
+            return "schedule_end" if session.get("window_end") == self._session_deadline(session) else "expired"
+        schedule = self._autonomous_schedule()
+        if schedule["enabled"]:
+            window = current_window(schedule, now)
+            if not window or session.get("window_start", window[0]) not in (None, window[0]):
+                return "schedule_end"
+        limit = self._autonomous_preferences().get("max_messages", self._settings.autonomous.max_messages)
+        if limit and session["sent"] >= limit:
+            return "limit"
+        return None
+
+    async def _scheduler_tick(self) -> None:
+        if not self._autonomy_ready or self._closing:
+            return
+        session = self._autonomous_session()
+        if session:
+            prefs = self._autonomous_preferences()
+            window = current_window(self._autonomous_schedule(), time.time())
+            if window and prefs.get("last_window") != window[0]:
+                prefs["last_window"] = window[0]
+                self._store.set_json("autonomous_preferences", prefs)
+            reason = self._autonomous_stop_reason(session)
+            if reason:
+                await self.stop_autonomous(reason)
+            return
+        schedule = self._autonomous_schedule()
+        if not schedule.get("armed") or self._pause_delay() != 0:
+            return
+        window = current_window(schedule, time.time())
+        if window and self._autonomous_preferences().get("last_window") != window[0]:
+            await self.start_autonomous("", window=window)
+
+    async def _run_scheduler(self) -> None:
+        while not self._closing:
+            try:
+                await self._scheduler_tick()
+            except Exception as exc:
+                self._store.log_event("autonomous_scheduler_error", {"error_type": type(exc).__name__})
+            await asyncio.sleep(1)
+
+    async def start_autonomous(
+        self, instruction: str, *, window: tuple[float, float] | None = None,
+    ) -> str:
         if self._autonomous_session():
             return "Автономная сессия уже активна."
         if not self._autonomy_ready or self._closing:
@@ -1409,15 +1524,33 @@ class PersonalAssistantRuntime:
             return "Сначала снимите временную паузу."
         if self._store.pending_outgoing(self._settings.target_chat_id):
             return "Проверьте переписку и подтвердите сверку командой /delivery_reviewed."
+        now = time.time()
+        prefs = self._autonomous_preferences()
+        schedule = self._autonomous_schedule()
+        allowed = current_window(schedule, now)
+        if schedule["enabled"] and allowed is None:
+            return "Сейчас вне разрешённого расписанием времени."
+        if window and (allowed != window or not schedule.get("armed") or prefs.get("last_window") == window[0]):
+            return "Это окно уже обработано."
+        if allowed:
+            # Consume the window before creating a session. A crash cannot replay an opener.
+            prefs["last_window"] = allowed[0]
+            self._store.set_json("autonomous_preferences", prefs)
         self._cancel_pending()
         # Claim the dialog before the worker starts, so reactive replies cannot race it.
-        now = time.time()
+        ends_at = now + prefs.get("duration_sec", self._settings.autonomous.max_duration_sec)
+        if allowed:
+            ends_at = min(ends_at, allowed[1])
         self._store.set_json("autonomous", {
             "id": uuid.uuid4().hex,
             "chat_id": self._settings.target_chat_id,
             "status": "active",
             "instruction": instruction.strip()[:1000],
             "started_at": now,
+            "ends_at": ends_at,
+            "window_start": allowed[0] if allowed else None,
+            "window_end": allowed[1] if allowed else None,
+            "mode": "scheduled" if window else "manual",
             "sent": 0,
         })
         if self._pause_delay() is None:
@@ -1428,9 +1561,15 @@ class PersonalAssistantRuntime:
         return "Автономная сессия запущена для настроенного чата."
 
     async def stop_autonomous(self, reason: str = "owner_stop") -> None:
+        if reason not in ("expired", "schedule_end", "limit"):
+            prefs = self._autonomous_preferences()
+            schedule = self._autonomous_schedule()
+            schedule["armed"] = False
+            prefs["schedule"] = schedule
+            self._store.set_json("autonomous_preferences", prefs)
         session = self._autonomous_session()
         if session:
-            session.update(status="stopped", reason=reason)
+            session.update(status="inactive" if reason in ("expired", "schedule_end") else "stopped", reason=reason)
             self._store.set_json("autonomous", session)
             runtime = self._store.get_json("runtime")
             runtime["mode"] = "off"
@@ -1438,6 +1577,8 @@ class PersonalAssistantRuntime:
         if session or reason in ("auto_off", "slash_stop"):
             self._cancel_pending()
             self._cancel_in_flight()
+        if session and reason in ("expired", "schedule_end"):
+            await self._send_alert("autonomous_finished", "Автономная сессия завершена по времени.")
 
     async def acknowledge_delivery_review(self) -> str:
         if self._send_lock.locked():
@@ -1454,14 +1595,25 @@ class PersonalAssistantRuntime:
     def describe_autonomous(self) -> str:
         session = self._store.get_json("autonomous")
         limits = self._settings.autonomous
-        expires = session.get("started_at", 0) + limits.max_duration_sec
+        prefs = self._autonomous_preferences()
+        zone = ZoneInfo(self._autonomous_schedule()["timezone"])
+        active = bool(self._autonomous_session())
+        expires = self._session_deadline(session) if "started_at" in session else 0
+        start = datetime.fromtimestamp(session["started_at"], zone).strftime("%Y-%m-%d %H:%M:%S %Z") if active else "—"
+        end = datetime.fromtimestamp(expires, zone).strftime("%Y-%m-%d %H:%M:%S %Z") if active else "—"
+        cap = prefs.get("max_messages", limits.max_messages)
         uncertain = self._store.pending_outgoing(self._settings.target_chat_id)
         return (
-            f"Автономия: {session.get('status', 'inactive')}\n"
+            f"Автономия: {'ACTIVE' if active else 'inactive'}\n"
+            f"Режим: {session.get('mode', 'manual' if active else '—')}\n"
             f"Чат: {self._settings.target_chat_id}\n"
-            f"Отправлено: {session.get('sent', 0)}/{limits.max_messages}\n"
-            f"Остаток сессии: {max(0, int(expires - time.time()))} с\n"
+            f"Начало: {start}\nОкончание: {end}\n"
+            f"Продолжительность новых сессий: {prefs.get('duration_sec', limits.max_duration_sec) // 60} мин\n"
+            f"Остаток: {max(0, int(expires - time.time())) if active else 0} с\n"
+            f"Отправлено: {session.get('sent', 0)}\n"
+            f"Лимит: {cap if cap else 'без фиксированного лимита'}\n"
             f"Интервал: {limits.min_interval_sec}–{limits.max_interval_sec} с\n"
+            f"{self.describe_autonomous_schedule()}\n"
             f"Пауза: {self._pause_delay() != 0}\n"
             f"Причина остановки: {session.get('reason', '—')}\n"
             f"Отправка требует сверки: {bool(uncertain)}"
@@ -1475,8 +1627,13 @@ class PersonalAssistantRuntime:
                 await self.stop_autonomous("target_is_not_private")
             self._autonomy_ready = True
             self._outgoing_ready = True
-        if self._autonomous_session():
+        await self._scheduler_tick()
+        if self._autonomous_session() and not (
+            self._pending_reply_task and not self._pending_reply_task.done()
+        ):
             self._queue_autonomous()
+        if not self._scheduler_task or self._scheduler_task.done():
+            self._scheduler_task = asyncio.create_task(self._run_scheduler())
 
     def _queue_autonomous(self) -> None:
         if self._pending_reply_task is not self._sending_task:
@@ -1492,27 +1649,24 @@ class PersonalAssistantRuntime:
             self._store.log_event("autonomous_error", {"error_type": type(exc).__name__})
             await self.stop_autonomous("generation_or_delivery_error")
 
-    def _within_autonomous_limits(self, session: dict[str, Any]) -> bool:
-        limits = self._settings.autonomous
-        return bool(session) and (
-            session["sent"] < limits.max_messages
-            and time.time() < session["started_at"] + limits.max_duration_sec
-        )
+    async def _stop_if_outside_autonomous_limits(self, session: dict[str, Any]) -> bool:
+        reason = self._autonomous_stop_reason(session)
+        if reason and session:
+            await self.stop_autonomous(reason)
+        return reason is not None
 
     async def _autonomous_turn(self) -> None:
         session = self._autonomous_session()
         if not session or self._closing:
             return
-        if not self._within_autonomous_limits(session):
-            await self.stop_autonomous("limit")
+        if await self._stop_if_outside_autonomous_limits(session):
             return
         delay = self._pause_delay()
         if delay is None:
             return
         if delay:
-            await asyncio.sleep(min(delay, max(0, session["started_at"] + self._settings.autonomous.max_duration_sec - time.time())))
-            if not self._within_autonomous_limits(self._autonomous_session()):
-                await self.stop_autonomous("limit")
+            await asyncio.sleep(min(delay, max(0, self._session_deadline(session) - time.time())))
+            if await self._stop_if_outside_autonomous_limits(self._autonomous_session()):
                 return
             if self._pause_delay() != 0:
                 return
@@ -1587,10 +1741,12 @@ class PersonalAssistantRuntime:
             text = (await self._llm_client.generate_reply(prompt, messages)).strip()
         if not text:
             raise ValueError("Empty autonomous reply")
-        await asyncio.sleep(max(0, session["send_after"] - time.time()))
+        if first:
+            text = "На связи автоматизированный ассистент.\n\n" + text
+        await asyncio.sleep(max(0, min(session["send_after"], self._session_deadline(session)) - time.time()))
         sent = await self._send_guarded(anchor, text=text[:4096], autonomous_id=session["id"], first=first)
-        if sent is not None and not self._within_autonomous_limits(self._autonomous_session()):
-            await self.stop_autonomous("limit")
+        if sent is not None:
+            await self._stop_if_outside_autonomous_limits(self._autonomous_session())
 
     async def _reconcile_outgoing(self) -> bool:
         chat = self._settings.target_chat_id
@@ -1626,8 +1782,7 @@ class PersonalAssistantRuntime:
             if autonomous_id:
                 if session.get("id") != autonomous_id:
                     return None
-                if not self._within_autonomous_limits(session):
-                    await self.stop_autonomous("limit")
+                if await self._stop_if_outside_autonomous_limits(session):
                     return None
                 if time.time() < session.get("send_after", 0):
                     return None

@@ -64,7 +64,7 @@ def test_start_repeat_first_and_no_unsolicited_followup(tmp_path, monkeypatch):
         assert session["id"] == store.get_json("autonomous")["id"]
         await worker(runtime)
         assert len(client.sent_messages) == 1
-        assert client.sent_messages[0].raw_text == "Claude reply"
+        assert client.sent_messages[0].raw_text == "На связи автоматизированный ассистент.\n\nClaude reply"
         prompt = model.calls[0][0]
         assert "Ask about the trip" in prompt
         assert "одна-две короткие фразы" in prompt
@@ -203,7 +203,7 @@ def test_message_and_duration_limits(tmp_path, monkeypatch):
         assert len(client.sent_messages) == 1
         await runtime.start_autonomous("")
         session = store.get_json("autonomous")
-        session["started_at"] = time.time() - 4000
+        session["ends_at"] = time.time() - 1
         store.set_json("autonomous", session)
         await worker(runtime)
         assert len(client.sent_messages) == 1

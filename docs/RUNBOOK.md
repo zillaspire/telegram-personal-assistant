@@ -93,7 +93,7 @@ Open the control bot in Telegram and send `/start`.
    startup. No manual migration is required. If necessary, restore the previous
    build from **Activity → Put this version back**.
 5. Use `/autonomous_start [задача]` only when you intend to contact the already
-   configured chat. The first reply identifies the AI. Later turns need a new
+   configured chat. The first reply identifies the automation. Later turns need a new
    incoming text. `/autonomous_stop` and `/auto_off` stop the session.
    `/resume` clears a pause, and a stopped session needs a fresh start.
    Voice auto-replies are still available in the regular reactive mode.
@@ -104,3 +104,48 @@ Open the control bot in Telegram and send `/start`.
 
 See the platform guides for [deploying from GitHub](https://blitz.cloud/docs/deploy-from-github/)
 and [persistent files](https://blitz.cloud/docs/settings-and-files/).
+
+
+## 8. Autonomous Mode 2.0
+
+Scheduling starts disabled. Configure it in the owner's Control Bot:
+
+```text
+/autonomous_duration 120
+/autonomous_set_timezone Europe/Kyiv
+/autonomous_set_days mon,tue,wed,thu,fri
+/autonomous_set_hours 22:00 03:00
+/autonomous_schedule_on
+/autonomous_schedule
+/autonomous_status
+```
+
+- `/autonomous_duration` takes any whole number from 15 to 300 minutes and
+  applies to new sessions. A permitted window may end the session sooner.
+- `/autonomous_schedule_on` authorizes one automatic opener per window.
+  Enabling it during an open window may start a session immediately.
+  The selected weekday is the day the overnight window opens.
+- `/autonomous_start [task]` starts a manual session. If the schedule is on,
+  manual starts are also limited to its open windows.
+- `/autonomous_stop`, `/auto_off`, and the recipient's `/stop` disarm future
+  automatic starts. To arm again, use `/autonomous_schedule_on`. That command
+  does not replay an already used window.
+- `/autonomous_limit 100` sets an optional message cap. `/autonomous_unlimited`
+  removes the cap. Subsequent messages still require incoming text.
+- The first message includes a short notice that the assistant is automated.
+  The assistant notifies the owner when a time limit or schedule ends.
+
+### Deploying 2.0 on blitz.cloud
+
+Before triggering a build, back up the SQLite files as described above and
+verify persistent storage. Schedule settings, the active deadline, consumed
+windows, and the outgoing ledger are stored in the application SQLite file.
+A redeploy without that file cannot restore them. Existing databases need no
+manual schema migration for 2.0. The build installs `tzdata` through
+`pyproject.toml`, so reinstall project dependencies for an in-place upgrade.
+
+After committing the reviewed changes to the app's source branch, check whether
+a build is already queued in **Activity**. If none is queued and the app uses
+manual updates, choose **Settings → Get the newest code**. Wait for the new
+commit to be marked **Live now**, then check `/autonomous_status` and
+`/autonomous_schedule` in Control Bot before arming the schedule.
