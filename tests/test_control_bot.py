@@ -55,3 +55,31 @@ def test_keyboard_contains_readable_buttons() -> None:
 def test_button_mapping_includes_edit_and_cancel_actions() -> None:
     assert BUTTON_TO_ACTION[BUTTON_EDIT_PROMPT] == "edit_prompt"
     assert BUTTON_TO_ACTION[BUTTON_CANCEL_INPUT] == "cancel_input"
+
+
+
+def test_offline_stop_is_applied_before_autonomy_restores():
+    import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from tg_personal_assistant.control_bot import ControlBotManager
+
+    foreign = SimpleNamespace(
+        effective_user=SimpleNamespace(id=2),
+        effective_message=SimpleNamespace(text="/auto_off"),
+        update_id=1,
+    )
+    owner = SimpleNamespace(
+        effective_user=SimpleNamespace(id=1),
+        effective_message=SimpleNamespace(text="/autonomous_stop"),
+        update_id=2,
+    )
+    assistant = SimpleNamespace(stop_autonomous=AsyncMock(), set_mode=AsyncMock())
+    bot = SimpleNamespace(get_updates=AsyncMock(side_effect=[[foreign, owner], []]))
+    manager = ControlBotManager("mock-token", 1, assistant)
+    manager._application = SimpleNamespace(bot=bot)
+    asyncio.run(manager._process_offline_stops())
+    assistant.stop_autonomous.assert_awaited_once_with()
+    assistant.set_mode.assert_not_awaited()
+    assert bot.get_updates.await_args.kwargs["offset"] == 3

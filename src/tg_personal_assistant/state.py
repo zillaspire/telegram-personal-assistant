@@ -38,6 +38,24 @@ class StateStore:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS outgoing (
+                    chat_id INTEGER NOT NULL,
+                    operation TEXT NOT NULL,
+                    anchor_id INTEGER NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    outgoing_id INTEGER,
+                    PRIMARY KEY (chat_id, operation)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS one_pending_outgoing_per_chat
+                ON outgoing(chat_id) WHERE outgoing_id IS NULL
+                """
+            )
             connection.commit()
 
     def get_json(self, key: str, default: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -93,3 +111,57 @@ class StateStore:
             "created_at": row["created_at"],
         }
 
+
+
+    def reserve_outgoing(
+        self, chat_id: int, operation: str, anchor_id: int, fingerprint: str,
+    ) -> bool:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "INSERT OR IGNORE INTO outgoing VALUES (?, ?, ?, ?, NULL)",
+                (chat_id, operation, anchor_id, fingerprint),
+            )
+            return cursor.rowcount == 1
+
+    def pending_outgoing(self, chat_id: int) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM outgoing WHERE chat_id = ? AND outgoing_id IS NULL",
+                (chat_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def complete_outgoing(self, chat_id: int, operation: str, outgoing_id: int) -> None:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE outgoing SET outgoing_id = ? WHERE chat_id = ? "
+                "AND operation = ? AND outgoing_id IS NULL",
+                (outgoing_id, chat_id, operation),
+            )
+            if cursor.rowcount != 1:
+                return
+            row = connection.execute(
+                "SELECT value_json FROM app_state WHERE key = 'autonomous'"
+            ).fetchone()
+            session = json.loads(row[0]) if row else {}
+            prefix = f"autonomous:{session.get('id')}:"
+            if session.get("chat_id") != chat_id or not operation.startswith(prefix):
+                return
+            session["sent"] += 1
+            session["last_outgoing_id"] = outgoing_id
+            session["last_operation"] = operation
+            connection.execute(
+                "UPDATE app_state SET value_json = ?, updated_at = CURRENT_TIMESTAMP "
+                "WHERE key = 'autonomous'",
+                (json.dumps(session, ensure_ascii=False),),
+            )
+
+
+    def abandon_outgoing(self, chat_id: int, operation: str) -> None:
+        # Keep the operation key as a tombstone to prevent replay.
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE outgoing SET outgoing_id = 0 WHERE chat_id = ? "
+                "AND operation = ? AND outgoing_id IS NULL",
+                (chat_id, operation),
+            )

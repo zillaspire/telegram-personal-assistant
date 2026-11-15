@@ -21,6 +21,23 @@ DEFAULT_TRIGGER_PHRASES = [
 ]
 
 
+@dataclass(frozen=True, slots=True)
+class AutonomousSettings:
+    min_interval_sec: int = 5
+    max_interval_sec: int = 12
+    max_messages: int = 20
+    max_duration_sec: int = 3600
+    history_limit: int = 24
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.min_interval_sec <= self.max_interval_sec <= 3600:
+            raise ValueError("Invalid autonomous reply interval")
+        if not 1 <= self.max_messages <= 1000 or not 1 <= self.max_duration_sec <= 86400:
+            raise ValueError("Invalid autonomous session limits")
+        if not 1 <= self.history_limit <= 100:
+            raise ValueError("Invalid autonomous history limit")
+
+
 @dataclass(slots=True)
 class AppSettings:
     config_path: Path
@@ -45,6 +62,7 @@ class AppSettings:
     tg_user_session: str
     control_bot_token: str
     groq_api_key: str | None
+    autonomous: AutonomousSettings = AutonomousSettings()
 
 
 def _require_int(source: dict[str, Any], key: str) -> int:
@@ -176,7 +194,14 @@ def load_settings(
         config_file.parent / sqlite_raw
     ).resolve()
 
+    defaults = AutonomousSettings()
+    autonomous = AutonomousSettings(**{
+        key: int(data.get("autonomous", {}).get(key, getattr(defaults, key)))
+        for key in ("min_interval_sec", "max_interval_sec", "max_messages", "max_duration_sec", "history_limit")
+    })
+
     return AppSettings(
+        autonomous=autonomous,
         config_path=config_file,
         secrets_path=secrets_file,
         sqlite_db_path=sqlite_db_path,

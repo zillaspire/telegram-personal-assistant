@@ -50,7 +50,7 @@ def test_build_session_turn_prompt_anchors_latest_incoming() -> None:
         ]
     )
     assert "Новые сообщения:" in prompt
-    assert "Последнее входящее сообщение от собеседника: Зайка" in prompt
+    assert "Последнее входящее сообщение: Зайка" in prompt
 
 
 def test_build_runtime_settings_state_preserves_persisted_prompt() -> None:

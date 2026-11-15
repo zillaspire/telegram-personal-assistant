@@ -1,4 +1,5 @@
 import asyncio
+from types import SimpleNamespace
 from pathlib import Path
 
 import tg_personal_assistant.assistant as assistant_module
@@ -45,19 +46,23 @@ class FakeClient:
     async def get_me(self):  # noqa: ANN202
         return type("FakeMe", (), {"id": 123456789})()
 
+    async def get_dialogs(self, limit=None):
+        return [SimpleNamespace(id=987654321, entity=987654321, is_user=True)]
+
+    async def get_input_entity(self, entity):
+        return entity
+
     def add_event_handler(self, handler, event_builder) -> None:
         self.handlers.append((handler, event_builder))
 
     async def get_messages(self, chat_id: int, limit: int, min_id: int | None = None):  # noqa: ANN202
-        del chat_id, min_id
-        if limit == 1:
-            return list(self.latest_messages)
-        return []
+        del chat_id
+        return [message for message in self.latest_messages if message.id > (min_id or 0)][:limit]
 
     async def send_message(self, chat_id: int, text: str) -> FakeMessage:
         next_id = max([message.id for message in self.latest_messages], default=0) + 1
         message = FakeMessage(next_id, out=True, raw_text=text)
-        self.latest_messages = [message]
+        self.latest_messages.insert(0, message)
         self.sent_messages.append(message)
         return message
 

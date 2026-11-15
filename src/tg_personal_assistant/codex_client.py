@@ -135,8 +135,7 @@ class CodexCliClient:
         if response.status_code != 200:
             raise RuntimeError(
                 f"OneKey API error "
-                f"{response.status_code}: "
-                f"{response.text[:500]}"
+                f"{response.status_code}"
             )
 
         result = response.json()

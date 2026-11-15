@@ -38,7 +38,7 @@ async def _run(config_path: str, secrets_path: str) -> None:
         voice_transcriber=voice_transcriber,
         voice_synthesizer=voice_synthesizer,
     )
-    await assistant.start()
+    await assistant.start(defer_outgoing=True)
     runtime = store.get_json("runtime")
     owner_id = int(runtime["owner_telegram_id"])
     control_bot = ControlBotManager(
@@ -47,22 +47,23 @@ async def _run(config_path: str, secrets_path: str) -> None:
         assistant=assistant,
     )
     assistant.attach_control_bot(control_bot)
-    await control_bot.start()
-
     stop_event = asyncio.Event()
-
-    def _handle_stop() -> None:
-        stop_event.set()
-
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, _handle_stop)
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except NotImplementedError:
+            pass
 
     try:
+        await control_bot.start()
+        await assistant.restore_autonomous()
         await stop_event.wait()
     finally:
-        await control_bot.stop()
-        await assistant.stop()
+        try:
+            await assistant.stop()
+        finally:
+            await control_bot.stop()
 
 
 def main() -> None:

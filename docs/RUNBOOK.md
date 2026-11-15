@@ -71,3 +71,36 @@ Open the control bot in Telegram and send `/start`.
 - Keep Codex CLI authenticated on the server user that runs the service.
 - Use `systemd`, Docker, or another process supervisor for long-running deployment.
 - Back up only the SQLite database if you need session continuity; never publish it.
+
+
+## 7. Update the existing blitz.cloud app
+
+1. In Control Bot, send `/auto_off` and verify that automation is stopped. Back
+   up the app SQLite database and the Claude session database privately. Check
+   that the directories containing the current `SQLITE_DB_PATH` and
+   `CLAUDE_SESSION_DB` are listed as persistent in the app's Settings → Files.
+   If they are not persistent, resolve that before relying on restart recovery.
+2. Copy the reviewed code changes into the source repository already connected
+   to the app. Keep runtime configuration, credentials, and SQLite files out of
+   the commit. Keep the current startup command and environment settings.
+3. Push to the branch followed by the **existing** app. A connected GitHub app
+   builds on push. For a manually refreshed GitHub source, open the existing
+   app's **Settings → Get the newest code**. Do not run a second copy with the
+   same control token or Telegram session. If an old poller is still active,
+   stop it and verify the new deployment starts without a polling conflict.
+4. Check the deployment's Activity and logs, then use `/status` and
+   `/autonomous_status` in Control Bot. The new SQLite table is created on
+   startup. No manual migration is required. If necessary, restore the previous
+   build from **Activity → Put this version back**.
+5. Use `/autonomous_start [задача]` only when you intend to contact the already
+   configured chat. The first reply identifies the AI. Later turns need a new
+   incoming text. `/autonomous_stop` and `/auto_off` stop the session.
+   `/resume` clears a pause, and a stopped session needs a fresh start.
+   Voice auto-replies are still available in the regular reactive mode.
+6. If status reports an uncertain delivery, review the target chat first.
+   `/delivery_reviewed` closes that operation without retrying it. Start a new
+   session explicitly if you want to continue. An outbound request already
+   accepted by Telegram cannot be recalled by the stop command.
+
+See the platform guides for [deploying from GitHub](https://blitz.cloud/docs/deploy-from-github/)
+and [persistent files](https://blitz.cloud/docs/settings-and-files/).

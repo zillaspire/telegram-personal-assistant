@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
@@ -71,9 +73,17 @@ class ControlBotManager:
         self._owner_id = owner_id
         self._assistant = assistant
         self._application: Application | None = None
+        self._free_text_task: asyncio.Task | None = None
 
     async def start(self) -> None:
         self._application = ApplicationBuilder().token(self._token).build()
+        for command, handler in (
+            ("autonomous_start", self._autonomous_start),
+            ("autonomous_stop", self._autonomous_stop),
+            ("autonomous_status", self._autonomous_status),
+            ("delivery_reviewed", self._delivery_reviewed),
+        ):
+            self._application.add_handler(CommandHandler(command, self._owner_only(handler)))
         self._application.add_handler(CommandHandler("start", self._owner_only(self._start)))
         self._application.add_handler(CommandHandler("help", self._owner_only(self._help)))
         self._application.add_handler(CommandHandler("status", self._owner_only(self._status)))
@@ -104,6 +114,10 @@ class ControlBotManager:
         await self._application.initialize()
         await self._application.bot.set_my_commands(
             [
+                BotCommand("autonomous_start", "Запустить автономный диалог"),
+                BotCommand("autonomous_stop", "Остановить автономный диалог"),
+                BotCommand("autonomous_status", "Проверить автономную сессию"),
+                BotCommand("delivery_reviewed", "Закрыть неопределённую отправку после проверки чата"),
                 BotCommand("start", "Открыть панель управления"),
                 BotCommand("help", "Показать список команд и что они делают"),
                 BotCommand("status", "Показать текущее состояние бота"),
@@ -124,14 +138,54 @@ class ControlBotManager:
         await self._application.start()
         if self._application.updater is None:
             raise RuntimeError("Control bot updater is unavailable")
-        await self._application.updater.start_polling(drop_pending_updates=True)
+        await self._process_offline_stops()
+        await self._application.updater.start_polling(drop_pending_updates=False)
+
+    async def _process_offline_stops(self) -> None:
+        # Apply safety commands queued while the service was offline before restoring sends.
+        offset = None
+        while True:
+            updates = await self._application.bot.get_updates(offset=offset, timeout=0)
+            if not updates:
+                return
+            for update in updates:
+                user = update.effective_user
+                message = update.effective_message
+                text = (message.text or "").strip() if message else ""
+                command = text.split(maxsplit=1)[0].split("@", 1)[0] if text else ""
+                if user is None or user.id != self._owner_id:
+                    continue
+                if command in ("/auto_off", "/off") or text == BUTTON_AUTO_OFF:
+                    await self._assistant.set_mode("off")
+                elif command == "/autonomous_stop":
+                    await self._assistant.stop_autonomous()
+                elif command in ("/pause_30m", "/pause_2h", "/pause") or text in (BUTTON_PAUSE_30M, BUTTON_PAUSE_2H):
+                    await self._assistant.pause_for(120 if command == "/pause_2h" or text == BUTTON_PAUSE_2H else 30)
+            offset = updates[-1].update_id + 1
+
+    async def _autonomous_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        result = await self._assistant.start_autonomous(" ".join(context.args or []))
+        await update.effective_message.reply_text(result, reply_markup=build_control_keyboard())
+
+    async def _autonomous_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._assistant.stop_autonomous()
+        await update.effective_message.reply_text("Автономная сессия остановлена.")
+
+    async def _autonomous_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await update.effective_message.reply_text(self._assistant.describe_autonomous())
+
+    async def _delivery_reviewed(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await update.effective_message.reply_text(await self._assistant.acknowledge_delivery_review())
 
     async def stop(self) -> None:
         if self._application is None:
             return
-        if self._application.updater is not None:
+        if self._application.updater is not None and self._application.updater.running:
             await self._application.updater.stop()
-        await self._application.stop()
+        if self._free_text_task and not self._free_text_task.done():
+            self._free_text_task.cancel()
+        if self._application.running:
+            await self._application.stop()
         await self._application.shutdown()
         self._application = None
 
@@ -154,6 +208,7 @@ class ControlBotManager:
         text = (
             "Панель управления готова.\n\n"
             "Самое полезное:\n"
+            "/autonomous_start [задача] · /autonomous_stop · /autonomous_status\n"
             "/status — текущее состояние\n"
             "/auto_on — включить автоответ\n"
             "/auto_off — выключить автоответ\n"
@@ -173,6 +228,7 @@ class ControlBotManager:
         del context
         text = (
             "Команды управления:\n\n"
+            "/autonomous_start [задача] · /autonomous_stop · /autonomous_status\n"
             "/status — показывает, включён ли автоответ, есть ли пауза и какой чат подключён\n"
             "/auto_on — включает автоответ\n"
             "/auto_off — полностью выключает автоответ\n"
@@ -358,6 +414,15 @@ class ControlBotManager:
         elif action == "help":
             await self._help(update, context)
             return
+        if self._application is not None:
+            if self._free_text_task and not self._free_text_task.done():
+                await update.effective_message.reply_text("Предыдущий запрос ещё обрабатывается.")
+                return
+            self._free_text_task = self._application.create_task(self._handle_free_text(update, text))
+            return
+        await self._handle_free_text(update, text)
+
+    async def _handle_free_text(self, update: Update, text: str) -> None:
         handled, response = await self._assistant.handle_owner_free_text(text)
         if handled:
             await update.effective_message.reply_text(
