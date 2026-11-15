@@ -64,9 +64,12 @@ def test_start_repeat_first_and_no_unsolicited_followup(tmp_path, monkeypatch):
         assert session["id"] == store.get_json("autonomous")["id"]
         await worker(runtime)
         assert len(client.sent_messages) == 1
-        assert "ИИ-ассистент" in client.sent_messages[0].raw_text
-        assert "/stop" in client.sent_messages[0].raw_text
-        assert "Ask about the trip" in model.calls[0][0]
+        assert client.sent_messages[0].raw_text == "Claude reply"
+        prompt = model.calls[0][0]
+        assert "Ask about the trip" in prompt
+        assert "одна-две короткие фразы" in prompt
+        assert "личные воспоминания" in prompt
+        assert "Подбери приветствие по ситуации" in prompt
         await runtime.restore_autonomous()
         await worker(runtime)
         assert len(client.sent_messages) == 1
@@ -83,8 +86,10 @@ def test_response_context_duplicate_and_reactive_exclusion(tmp_path, monkeypatch
         msg = await incoming(runtime, client, "The trip was great")
         await worker(runtime)
         assert len(client.sent_messages) == 2
+        assert client.sent_messages[-1].raw_text == "Claude reply"
+        assert "без повторного приветствия" in model.calls[-1][0]
         assert "The trip was great" in model.calls[-1][1][0]["content"]
-        assert "ИИ-ассистент" in model.calls[-1][1][0]["content"]
+        assert "Claude reply" in model.calls[-1][1][0]["content"]
         await incoming(runtime, client, msg.raw_text, duplicate=msg)
         await worker(runtime)
         assert len(client.sent_messages) == 2
